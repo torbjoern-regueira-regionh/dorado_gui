@@ -3,12 +3,14 @@
 A simple Windows front-end for `dorado basecaller`. It only uses the Python standard library (tkinter).
 
 ## Install (once per PC)
-1. Install Python 3.10+ from python.org. Keep the default "tcl/tk and IDLE" option ticked.
+1. Make sure Python 3.10+ is installed along with git.
 2. Unzip dorado (for example `C:\dorado-2.1.0-win64`).
 3. Copy `dorado_gui.pyw` and `Start Dorado GUI.bat` into the same folder.
 
 ## Use
-Double-click `dorado_gui.pyw`, or the `.bat` file if `.pyw` isn't associated with Python.
+Firstly, make sure that python and git is installed on the PC.
+
+Double-click `dorado_gui.pyw`.
 
 1. **dorado executable**: `...\dorado-x.y.z-win64\bin\dorado.exe`. The GUI finds it automatically if it is on PATH or in `C:\`, Program Files, home or Downloads.
 2. **Models directory** (recommended): a fixed folder such as `D:\dorado_models`. Models download once and are reused, and runs work offline after that.
