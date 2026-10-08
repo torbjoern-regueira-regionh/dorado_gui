@@ -5,11 +5,9 @@ A simple Windows front-end for `dorado basecaller`. It only uses the Python stan
 ## Install (once per PC)
 1. Make sure Python 3.10+ is installed along with git.
 2. Unzip dorado (for example `C:\dorado-2.1.0-win64`).
-3. Copy `dorado_gui.pyw` and `Start Dorado GUI.bat` into the same folder.
+3. Clone this repo, then optionally copy `dorado_gui.pyw` and `Start Dorado GUI.bat` into the same folder.
 
 ## Use
-Firstly, make sure that python and git is installed on the PC.
-
 Double-click `dorado_gui.pyw`.
 
 1. **dorado executable**: `...\dorado-x.y.z-win64\bin\dorado.exe`. The GUI finds it automatically if it is on PATH or in `C:\`, Program Files, home or Downloads.
