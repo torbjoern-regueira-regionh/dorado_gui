@@ -20,6 +20,8 @@ Double-click `dorado_gui.pyw`.
 5. Options: barcode kit, `--no-trim`, min Q-score, FASTQ output, alignment reference, poly(A) estimation, device and free-text extra arguments.
 6. **Start**. The output appears in the log window and is also saved as `dorado_gui_<timestamp>.log` in the output folder. **Copy** copies the exact command line.
 
+Dorado only draws its progress bar in a terminal, so it prints nothing between its start-up messages and the final summary. While it runs, the line above the log shows how much output has been written and how fast, and every 10 minutes a line with the time and the output size is added to the log. If a run crashes, the last of these lines tells when and how far it got.
+
 ## Resume a crashed run
 If basecalling crashed or the PC restarted, the reads that were already written do not have to be basecalled again.
 
@@ -29,6 +31,7 @@ If basecalling crashed or the PC restarted, the reads that were already written 
 4. **Start**. The GUI first joins the old BAM files into one temporary file (`_resume_input.bam` in the new output folder), because `dorado --resume-from` accepts only a single file. Then it starts dorado, which copies those reads into the new output and basecalls only the remaining ones.
 
 - A resumed run writes all reads to a single file, `calls.bam` (or `calls.fastq`) in the new output folder, instead of `bam_pass`/`bam_fail` subfolders: dorado does not accept `--resume-from` together with `--output-dir`. With a barcode kit the barcode of each read is stored in that file; split it per barcode afterwards with `dorado demux --no-classify --output-dir <folder> calls.bam`.
+- BAM files written by MinKNOW can be resumed from as well. Dorado itself refuses them (`'CL' (Command Line) header is invalid`), because it wants to read the previous `dorado basecaller` command from the file to check the model. The GUI therefore writes the current model selection into the temporary file, shows you the model MinKNOW recorded and asks before it starts. Make sure it is the same model: dorado can no longer check this, and with different models the output is a mix of both.
 - Reads are copied unchanged, so modified-base calls (MM/ML tags), barcodes and all other tags are kept.
 - BAM files that were cut off by the crash are fine: their complete reads are used and the broken end is dropped. This is listed in the log.
 - The old BAM files are only read. Once the resumed run has finished and you have checked it, the old output folder can be deleted; the new one is complete.
