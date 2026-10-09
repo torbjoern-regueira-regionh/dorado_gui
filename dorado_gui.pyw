@@ -27,6 +27,7 @@ import sys
 import threading
 import time
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -162,6 +163,8 @@ RESUME_INFO = "_resume_input.json"  # what RESUME_FILE was joined from, so a ret
 # this one file (.bam or .fastq) through stdout instead
 RESUME_OUTPUT = "calls"
 BGZF_EOF = bytes.fromhex("1f8b08040000000000ff0600424302001b0003000000000000000000")
+COPY_CHUNK = 8 << 20   # bytes read/written at a time
+INFLATE_BATCH = 64     # BGZF blocks handed to a worker thread at a time
 
 
 def find_bams(folder):
@@ -222,8 +225,9 @@ def is_within(path, parent):
         return False
 
 
-def read_bgzf_block(fh):
-    """Next BGZF block as (raw, data); None at end of file. ValueError if truncated/damaged."""
+def read_bgzf_raw(fh):
+    """Next BGZF block still compressed, as (raw, payload offset); None at end of file.
+    ValueError if truncated/damaged."""
     head = fh.read(12)
     if not head:
         return None
@@ -242,14 +246,40 @@ def read_bgzf_block(fh):
     rest = fh.read(size - 12 - xlen)
     if len(rest) < size - 12 - xlen:
         raise ValueError("truncated block")
-    crc, isize = struct.unpack_from("<II", rest, len(rest) - 8)
+    return head + extra + rest, 12 + xlen
+
+
+def inflate_bgzf(raw, offset):
+    """Decompressed content of a block from read_bgzf_raw. ValueError if damaged."""
+    crc, isize = struct.unpack_from("<II", raw, len(raw) - 8)
     try:
-        data = zlib.decompress(rest[:-8], -15)
+        data = zlib.decompress(memoryview(raw)[offset:-8], -15)
     except zlib.error:
         raise ValueError("damaged block") from None
     if len(data) != isize or zlib.crc32(data) != crc:
         raise ValueError("damaged block")
-    return head + extra + rest, data
+    return data
+
+
+def inflate_many(blocks):
+    """inflate_bgzf for a list of blocks (run in a worker thread; zlib releases the GIL).
+    The list stops with None at the first damaged block."""
+    out = []
+    for raw, offset in blocks:
+        try:
+            out.append(inflate_bgzf(raw, offset))
+        except ValueError:
+            out.append(None)
+            break
+    return out
+
+
+def read_bgzf_block(fh):
+    """Next BGZF block as (raw, data); None at end of file. ValueError if truncated/damaged."""
+    blk = read_bgzf_raw(fh)
+    if blk is None:
+        return None
+    return blk[0], inflate_bgzf(*blk)
 
 
 def write_bgzf(out, data):
@@ -419,36 +449,84 @@ class _RecordCopier:
 
 
 def merge_bams(paths, header, out_path, progress=None, cancel=None):
-    """Join BAM files into one. Returns (n_records, truncated) where truncated lists the
-    files that were cut short (their complete records are still used).
-    progress(done_bytes) is called now and then; cancel is a threading.Event."""
-    truncated, done, last_report = [], 0, 0.0
-    with open(out_path, "wb") as out:
+    """Join BAM files into one. Returns (n_records, truncated, whole): truncated lists the
+    files that were cut short (their complete records are still used), whole is the size of
+    the files that were copied as they are and whose records are not in n_records.
+    progress(done_bytes) is called now and then; cancel is a threading.Event.
+
+    A file that ends with the BGZF end-of-file marker was closed properly, so it ends on a
+    record boundary and its blocks are copied without looking inside. Only files without
+    the marker (cut off by the crash) are decompressed, on several threads, to find the
+    last complete record."""
+    truncated, done, whole, last_report = [], 0, 0, 0.0
+    workers = min(8, os.cpu_count() or 1)
+
+    def tick(pos):
+        nonlocal last_report
+        if cancel is not None and cancel.is_set():
+            raise InterruptedError
+        if progress and time.time() - last_report > 0.25:
+            last_report = time.time()
+            progress(done + pos)
+
+    with open(out_path, "wb", buffering=COPY_CHUNK) as out, ThreadPoolExecutor(workers) as pool:
         write_bgzf(out, header)
         copier = _RecordCopier(out)
         for p in paths:
             damaged = False
-            with open(p, "rb") as fh:
+            with open(p, "rb", buffering=COPY_CHUNK) as fh:
+                size = os.fstat(fh.fileno()).st_size
+                complete = False
+                if size > len(BGZF_EOF):
+                    fh.seek(size - len(BGZF_EOF))
+                    complete = fh.read() == BGZF_EOF
+                    fh.seek(0)
                 try:
                     _, _, rest = read_bam_header(fh)
+                    if complete:
+                        left = size - len(BGZF_EOF) - fh.tell()
+                        if rest or left > 0:
+                            whole += size
+                        write_bgzf(out, rest)
+                        while left > 0:
+                            chunk = fh.read(min(COPY_CHUNK, left))
+                            if not chunk:
+                                break
+                            out.write(chunk)
+                            left -= len(chunk)
+                            tick(fh.tell())
+                        continue
                     copier.feed(None, rest)
-                    while True:
-                        blk = read_bgzf_block(fh)
-                        if blk is None:
-                            break
-                        copier.feed(*blk)
-                        if cancel is not None and cancel.is_set():
-                            raise InterruptedError
-                        if progress and time.time() - last_report > 0.25:
-                            last_report = time.time()
-                            progress(done + fh.tell())
+                    at_end = False
+                    while not at_end:
+                        # read a batch of blocks, inflate them in parallel, walk them in order
+                        blocks, cut = [], False
+                        try:
+                            while len(blocks) < INFLATE_BATCH * workers:
+                                blk = read_bgzf_raw(fh)
+                                if blk is None:
+                                    at_end = True
+                                    break
+                                blocks.append(blk)
+                        except ValueError:
+                            cut = at_end = True  # the blocks before the broken one still count
+                        parts = [blocks[i:i + INFLATE_BATCH] for i in range(0, len(blocks), INFLATE_BATCH)]
+                        for part, datas in zip(parts, pool.map(inflate_many, parts)):
+                            for (raw, _), data in zip(part, datas):
+                                if data is None:
+                                    raise ValueError("damaged block")
+                                copier.feed(raw, data)
+                        if cut:
+                            raise ValueError("truncated block")
+                        tick(fh.tell())
                 except ValueError:
                     damaged = True
+                finally:
+                    done += size
             if copier.finish_file() or damaged:
                 truncated.append(p)
-            done += os.path.getsize(p)
         out.write(BGZF_EOF)
-    return copier.records, truncated
+    return copier.records, truncated, whole
 
 
 def popen_kwargs():
@@ -1129,7 +1207,7 @@ class DoradoGUI(tk.Tk):
         if info:
             self._log("# Using the resume file left by the previous attempt (old BAM files unchanged)\n")
             self.start_time = time.time()
-            self._merged(cmd, info.get("records", -1), info.get("truncated", []))
+            self._merged(cmd, info.get("records", 0), info.get("truncated", []), info.get("whole", 0))
             return
         self._remove_resume_file(forget=False)  # outdated leftovers
         try:
@@ -1147,16 +1225,16 @@ class DoradoGUI(tk.Tk):
 
         def worker():
             try:
-                n, truncated = merge_bams(paths, header, dest + ".part", progress, cancel)
+                n, truncated, whole = merge_bams(paths, header, dest + ".part", progress, cancel)
                 os.replace(dest + ".part", dest)
-                if sources is not None and n:
+                if sources is not None and (n or whole):
                     try:  # lets a later attempt reuse the file instead of joining again
                         with open(os.path.join(os.path.dirname(dest), RESUME_INFO), "w", encoding="utf-8") as fh:
                             json.dump({"sources": sources, "records": n, "truncated": truncated,
-                                       "size": os.path.getsize(dest)}, fh)
+                                       "whole": whole, "size": os.path.getsize(dest)}, fh)
                     except OSError:
                         pass
-                self.msg_queue.put(("merged", (cmd, n, truncated)))
+                self.msg_queue.put(("merged", (cmd, n, truncated, whole)))
             except InterruptedError:
                 self.msg_queue.put(("merge_failed", None))
             except OSError as e:
@@ -1165,13 +1243,17 @@ class DoradoGUI(tk.Tk):
         self.merge_thread = threading.Thread(target=worker, daemon=True)
         self.merge_thread.start()
 
-    def _merged(self, cmd, n, truncated):
+    def _merged(self, cmd, n, truncated, whole):
         self.merge_cancel = None
         self.v_progress.set("")
         for p in truncated:
             self._log(f"# Incomplete file (cut off by the crash), complete reads kept: {p}\n")
-        self._log(f"# {n} reads from the previous run will be kept and not basecalled again\n")
-        if n == 0:
+        # complete files are copied without counting their reads
+        kept = " and ".join(([f"{fmt_size(whole)} of complete BAM files"] if whole else [])
+                            + ([f"{n} reads from incomplete files"] if truncated and whole else [])
+                            + ([f"{n} reads"] if not whole else []))
+        self._log(f"# {kept} from the previous run will be kept and not basecalled again\n")
+        if n == 0 and not whole:
             self._abort_start("The old BAM files contain no complete reads, so there is nothing to "
                               "resume from. Untick 'Resume from BAM folder' to basecall from scratch.")
             return
