@@ -20,6 +20,8 @@ Double-click `dorado_gui.pyw`.
 5. Options: barcode kit, `--no-trim`, min Q-score, FASTQ output, alignment reference, poly(A) estimation, device and free-text extra arguments.
 6. **Start**. The output appears in the log window and is also saved as `dorado_gui_<timestamp>.log` in the output folder. **Copy** copies the exact command line.
 
+Dorado only draws its progress bar in a terminal, so it prints nothing between its start-up messages and the final summary. While it runs, the line above the log shows how much output has been written and how fast, and every 10 minutes a line with the time and the output size is added to the log. If a run crashes, the last of these lines tells when and how far it got.
+
 ## Resume a crashed run
 If basecalling crashed or the PC restarted, the reads that were already written do not have to be basecalled again.
 

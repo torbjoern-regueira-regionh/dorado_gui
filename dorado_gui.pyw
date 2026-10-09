@@ -88,6 +88,11 @@ KITS = [
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
+# dorado draws its progress bar only in a terminal, so started from here it stays silent
+# until it is done. The GUI therefore reports how much output has been written.
+OUTPUT_CHECK_SECS = 10    # how often the output size is measured for the progress line
+HEARTBEAT_SECS = 600      # how often a line with time and output size is added to the log
+
 
 def mod_base(mod):
     """Canonical base a modification model acts on (used to prevent clashes)."""
@@ -184,6 +189,21 @@ def total_size(paths):
             n += os.path.getsize(p)
         except OSError:
             pass
+    return n
+
+
+def tree_size(folder):
+    """Size of all files below folder, without this GUI's own log and resume files."""
+    n = 0
+    for root, _, files in os.walk(folder):
+        for f in files:
+            if f in (RESUME_FILE, RESUME_FILE + ".part", RESUME_INFO) \
+                    or (f.startswith("dorado_gui_") and f.endswith(".log")):
+                continue
+            try:
+                n += os.path.getsize(os.path.join(root, f))
+            except OSError:
+                pass
     return n
 
 
@@ -553,6 +573,10 @@ class DoradoGUI(tk.Tk):
         self.merge_thread = None
         self.resume_path = None
         self.stdout_path = None  # file dorado's stdout goes to (resumed runs only)
+        self.progress_at = 0.0   # when dorado last reported progress itself
+        self.out_base = 0        # size of the output folder before dorado started
+        self.out_history = []    # (time, bytes written) of the last minutes, for the rate
+        self.next_output_check = self.next_heartbeat = 0.0
 
         self._make_vars()
         self._load_settings()
@@ -1300,6 +1324,7 @@ class DoradoGUI(tk.Tk):
 
     def _launch(self, cmd):
         out_fh = None
+        self.out_base = 0 if self.stdout_path else tree_size(self.v_output.get())
         try:
             if self.stdout_path:
                 # the reads go straight into the file, only messages and progress come to the GUI
@@ -1319,6 +1344,9 @@ class DoradoGUI(tk.Tk):
                 out_fh.close()
 
         self.start_time = time.time()
+        self.out_history = []
+        self.next_output_check = self.start_time + OUTPUT_CHECK_SECS
+        self.next_heartbeat = self.start_time + HEARTBEAT_SECS
         self.v_status.set("Running…")
         threading.Thread(target=self._reader, args=(self.proc, stream), daemon=True).start()
         self._tick()
@@ -1337,6 +1365,8 @@ class DoradoGUI(tk.Tk):
                 if not cands:
                     break
                 i = min(cands)
+                if i == len(buf) - 1 and buf[i:] == b"\r":
+                    break  # could be the first half of a Windows line end: wait for the next byte
                 line = ANSI_RE.sub("", buf[:i].decode("utf-8", errors="replace"))
                 is_progress = buf[i:i + 1] == b"\r" and buf[i + 1:i + 2] != b"\n"
                 buf = buf[i + 1:]
@@ -1364,9 +1394,40 @@ class DoradoGUI(tk.Tk):
 
     def _tick(self):
         if self.proc is not None:
-            el = int(time.time() - self.start_time)
-            self.v_status.set(f"Running…  {el // 3600:d}:{el % 3600 // 60:02d}:{el % 60:02d}")
+            now = time.time()
+            el = int(now - self.start_time)
+            dur = f"{el // 3600:d}:{el % 3600 // 60:02d}:{el % 60:02d}"
+            self.v_status.set(f"Running…  {dur}")
+            if now >= self.next_output_check:
+                self.next_output_check = now + OUTPUT_CHECK_SECS
+                self._report_output(now, dur)
             self.after(1000, self._tick)
+
+    def _output_size(self):
+        """Bytes dorado has written so far in this run."""
+        if self.stdout_path:
+            try:
+                return os.path.getsize(self.stdout_path)
+            except OSError:
+                return 0
+        return max(0, tree_size(self.v_output.get()) - self.out_base)
+
+    def _report_output(self, now, dur):
+        """Progress line and regular log lines from the size of the output, as dorado
+        reports no progress itself when it is not run in a terminal."""
+        size = self._output_size()
+        self.out_history.append((now, size))
+        while len(self.out_history) > 2 and now - self.out_history[1][0] >= 300:
+            del self.out_history[0]
+        text = f"Output written so far: {fmt_size(size)}"
+        t0, s0 = self.out_history[0]
+        if now - t0 >= 60:
+            text += f"  ({fmt_size(max(0, size - s0) * 60 / (now - t0))} per minute)"
+        if now - self.progress_at > 3 * OUTPUT_CHECK_SECS:
+            self.v_progress.set(text)
+        if now >= self.next_heartbeat:
+            self.next_heartbeat = now + HEARTBEAT_SECS
+            self._log(f"# {time.strftime('%H:%M:%S')}  running for {dur}, {text[0].lower()}{text[1:]}\n")
 
     def _poll_queue(self):
         try:
@@ -1375,6 +1436,7 @@ class DoradoGUI(tk.Tk):
                 if kind == "log":
                     self._log(payload)
                 elif kind == "progress":
+                    self.progress_at = time.time()
                     self.v_progress.set(payload[-160:])
                 elif kind == "done":
                     self._finished(payload)
@@ -1406,12 +1468,14 @@ class DoradoGUI(tk.Tk):
         self.proc = None
         self.btn_start.configure(state="normal")
         self.btn_stop.configure(state="disabled")
+        written = f"{fmt_size(self._output_size())} of output written"
         if rc == 0:
             self.v_status.set(f"Finished ✔  ({dur})")
-            self._log(f"\n# Finished successfully in {dur}\n")
+            self._log(f"\n# Finished successfully in {dur}, {written}\n")
         else:
             self.v_status.set(f"Failed / stopped (exit code {rc})")
-            self._log(f"\n# dorado exited with code {rc} after {dur}\n")
+            self._log(f"\n# dorado exited with code {rc} after {dur}, {written}\n")
+        self.v_progress.set("")
         if rc == 0:
             self._remove_resume_file()
         elif self.resume_path:
