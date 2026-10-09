@@ -9,6 +9,7 @@ A small Tkinter front-end for `dorado basecaller` on Windows (works on Linux/mac
   (or point to a locally downloaded model folder)
 - barcoding kit, trimming, min-qscore, FASTQ output, alignment, poly(A), device
 - live command preview, streamed log, progress line and Stop button
+- resume a crashed run from the BAM files it left behind (e.g. a bam_pass folder)
 
 Run by double-clicking this file (.pyw = no console window) or `python dorado_gui.pyw`.
 Only the Python standard library is used.
@@ -20,10 +21,12 @@ import queue
 import re
 import shlex
 import shutil
+import struct
 import subprocess
 import sys
 import threading
 import time
+import zlib
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -145,6 +148,284 @@ def count_pod5(folder, recursive):
     return n
 
 
+# ---------------------------------------------------------------------------
+# Resume support
+# `dorado basecaller --resume-from` takes a single BAM, but a crashed run that
+# wrote to an output folder leaves many (bam_pass/..., one per barcode/batch),
+# the last of which are usually truncated. The functions below join them into
+# one BAM using only the standard library. Records are copied byte-for-byte, so
+# all tags (MM/ML modification calls, barcodes, poly(A), moves, ...) are kept.
+# ---------------------------------------------------------------------------
+RESUME_FILE = "_resume_input.bam"
+BGZF_EOF = bytes.fromhex("1f8b08040000000000ff0600424302001b0003000000000000000000")
+
+
+def find_bams(folder):
+    """All .bam files below folder (sorted), ignoring resume files written by this GUI."""
+    found = []
+    for root, _, files in os.walk(folder):
+        for f in files:
+            if f.lower().endswith(".bam") and f != RESUME_FILE:
+                found.append(os.path.join(root, f))
+    return sorted(found)
+
+
+def total_size(paths):
+    n = 0
+    for p in paths:
+        try:
+            n += os.path.getsize(p)
+        except OSError:
+            pass
+    return n
+
+
+def fmt_size(n):
+    for unit in ("bytes", "kB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "bytes" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def is_within(path, parent):
+    """True if path is parent or lies inside it."""
+    path = os.path.normcase(os.path.abspath(path))
+    parent = os.path.normcase(os.path.abspath(parent))
+    try:
+        return os.path.commonpath([path, parent]) == parent
+    except ValueError:  # different drives
+        return False
+
+
+def read_bgzf_block(fh):
+    """Next BGZF block as (raw, data); None at end of file. ValueError if truncated/damaged."""
+    head = fh.read(12)
+    if not head:
+        return None
+    if len(head) < 12 or head[:4] != b"\x1f\x8b\x08\x04":
+        raise ValueError("truncated or damaged block")
+    xlen = struct.unpack_from("<H", head, 10)[0]
+    extra = fh.read(xlen)
+    size, i = None, 0
+    while i + 4 <= len(extra):
+        slen = struct.unpack_from("<H", extra, i + 2)[0]
+        if extra[i:i + 2] == b"BC" and slen == 2 and i + 6 <= len(extra):
+            size = struct.unpack_from("<H", extra, i + 4)[0] + 1
+        i += 4 + slen
+    if len(extra) < xlen or size is None or size < 12 + xlen + 8:
+        raise ValueError("truncated or damaged block")
+    rest = fh.read(size - 12 - xlen)
+    if len(rest) < size - 12 - xlen:
+        raise ValueError("truncated block")
+    crc, isize = struct.unpack_from("<II", rest, len(rest) - 8)
+    try:
+        data = zlib.decompress(rest[:-8], -15)
+    except zlib.error:
+        raise ValueError("damaged block") from None
+    if len(data) != isize or zlib.crc32(data) != crc:
+        raise ValueError("damaged block")
+    return head + extra + rest, data
+
+
+def write_bgzf(out, data):
+    for i in range(0, len(data), 0xff00):
+        chunk = data[i:i + 0xff00]
+        comp = zlib.compressobj(1, zlib.DEFLATED, -15)
+        cdata = comp.compress(chunk) + comp.flush()
+        out.write(b"\x1f\x8b\x08\x04\x00\x00\x00\x00\x00\xff\x06\x00BC\x02\x00"
+                  + struct.pack("<H", len(cdata) + 25) + cdata
+                  + struct.pack("<II", zlib.crc32(chunk), len(chunk)))
+
+
+def read_bam_header(fh):
+    """Read a BAM header. Returns (text, refs, rest): the SAM header text, the binary
+    reference list and any record bytes that followed the header in the last block read."""
+    buf = bytearray()
+
+    def fill(n):
+        while len(buf) < n:
+            blk = read_bgzf_block(fh)
+            if blk is None:
+                raise ValueError("file is empty or ends inside the header")
+            buf.extend(blk[1])
+
+    fill(8)
+    if buf[:4] != b"BAM\x01":
+        raise ValueError("not a BAM file")
+    l_text = struct.unpack_from("<i", buf, 4)[0]
+    if l_text < 0:
+        raise ValueError("damaged header")
+    refs_start = pos = 8 + l_text
+    fill(pos + 4)
+    n_ref = struct.unpack_from("<i", buf, pos)[0]
+    pos += 4
+    for _ in range(n_ref):
+        fill(pos + 4)
+        l_name = struct.unpack_from("<i", buf, pos)[0]
+        if l_name < 0:
+            raise ValueError("damaged header")
+        pos += 4 + l_name + 4
+        fill(pos)
+    return bytes(buf[8:8 + l_text]), bytes(buf[refs_start:pos]), bytes(buf[pos:])
+
+
+def scan_bam_headers(paths):
+    """Returns (good, bad): good = [(path, text, refs)], bad = [(path, reason)]."""
+    good, bad = [], []
+    for p in paths:
+        try:
+            with open(p, "rb") as fh:
+                text, refs, _ = read_bam_header(fh)
+            good.append((p, text, refs))
+        except (OSError, ValueError) as e:
+            bad.append((p, str(e)))
+    return good, bad
+
+
+def merged_header(headers):
+    """Header of the first file plus any @RG lines that only occur in the others."""
+    text, refs = headers[0]
+    lines = text.rstrip(b"\x00").splitlines()
+
+    def rg_id(line):
+        for field in line.split(b"\t")[1:]:
+            if field.startswith(b"ID:"):
+                return field
+        return None
+
+    seen = {rg_id(ln) for ln in lines if ln.startswith(b"@RG")}
+    for other, _ in headers[1:]:
+        for ln in other.rstrip(b"\x00").splitlines():
+            if ln.startswith(b"@RG") and rg_id(ln) not in seen:
+                seen.add(rg_id(ln))
+                lines.append(ln)
+    text = b"\n".join(lines) + b"\n"
+    return b"BAM\x01" + struct.pack("<i", len(text)) + text + refs
+
+
+def basecaller_cl(text):
+    """Command line of the `dorado basecaller` run recorded in a BAM header ('' if none)."""
+    for line in text.rstrip(b"\x00").decode("utf-8", errors="replace").splitlines():
+        if line.startswith("@PG"):
+            fields = dict(f.split(":", 1) for f in line.split("\t")[1:] if ":" in f)
+            if fields.get("ID", "").startswith("basecaller"):
+                return fields.get("CL", "")
+    return ""
+
+
+def model_name(arg):
+    """Model argument reduced to what dorado compares on resume (folder name for paths)."""
+    arg = arg.strip().strip('"\'').rstrip("\\/")
+    return re.split(r"[\\/]", arg)[-1]
+
+
+def cl_model(cl):
+    """Model argument of a recorded `dorado basecaller` command line ('' if unclear)."""
+    try:
+        tokens = shlex.split(cl, posix=False)
+    except ValueError:
+        return ""
+    if "basecaller" in tokens[:-1]:
+        tok = tokens[tokens.index("basecaller") + 1]
+        if not tok.startswith("-"):
+            return model_name(tok)
+    return ""
+
+
+class _RecordCopier:
+    """Copies whole BAM records to `out`, block by block. Untouched BGZF blocks are copied
+    as they are (no recompression); a partial record at the end of a file is dropped."""
+
+    def __init__(self, out):
+        self.out = out
+        self.records = 0
+        self.start_file()
+
+    def start_file(self):
+        self.need = 0        # bytes left of the current record
+        self.lenbuf = b""    # partially read record length
+        self.held = []       # (raw, data, cut) blocks after the last record end written
+
+    def _write(self, raw, data):
+        if raw is not None:
+            self.out.write(raw)
+        else:
+            write_bgzf(self.out, data)
+
+    def feed(self, raw, data):
+        """Add a block; raw=None means it has to be recompressed. ValueError if damaged."""
+        pos, n, last, bad = 0, len(data), 0, False
+        while pos < n:
+            if self.need:
+                step = min(self.need, n - pos)
+                pos += step
+                self.need -= step
+                if not self.need:
+                    last = pos
+                    self.records += 1
+            else:
+                take = min(4 - len(self.lenbuf), n - pos)
+                self.lenbuf += data[pos:pos + take]
+                pos += take
+                if len(self.lenbuf) == 4:
+                    self.need = struct.unpack("<i", self.lenbuf)[0]
+                    self.lenbuf = b""
+                    if not 32 <= self.need < 1 << 30:
+                        bad = True
+                        break
+        if last:
+            for r, d, _ in self.held:
+                self._write(r, d)
+            self.held = []
+        if last == n:
+            self._write(raw, data)
+        elif n:
+            self.held.append((raw, data, last))
+        if bad:
+            raise ValueError("damaged record")
+
+    def finish_file(self):
+        """Write what is complete; returns True if the file ended in the middle of a record."""
+        cut_short = bool(self.held)
+        if cut_short and self.held[0][2]:
+            write_bgzf(self.out, self.held[0][1][:self.held[0][2]])
+        self.start_file()
+        return cut_short
+
+
+def merge_bams(paths, header, out_path, progress=None, cancel=None):
+    """Join BAM files into one. Returns (n_records, truncated) where truncated lists the
+    files that were cut short (their complete records are still used).
+    progress(done_bytes) is called now and then; cancel is a threading.Event."""
+    truncated, done, last_report = [], 0, 0.0
+    with open(out_path, "wb") as out:
+        write_bgzf(out, header)
+        copier = _RecordCopier(out)
+        for p in paths:
+            damaged = False
+            with open(p, "rb") as fh:
+                try:
+                    _, _, rest = read_bam_header(fh)
+                    copier.feed(None, rest)
+                    while True:
+                        blk = read_bgzf_block(fh)
+                        if blk is None:
+                            break
+                        copier.feed(*blk)
+                        if cancel is not None and cancel.is_set():
+                            raise InterruptedError
+                        if progress and time.time() - last_report > 0.25:
+                            last_report = time.time()
+                            progress(done + fh.tell())
+                except ValueError:
+                    damaged = True
+            if copier.finish_file() or damaged:
+                truncated.append(p)
+            done += os.path.getsize(p)
+        out.write(BGZF_EOF)
+    return copier.records, truncated
+
+
 def popen_kwargs():
     kw = {}
     if IS_WINDOWS:
@@ -165,6 +446,9 @@ class DoradoGUI(tk.Tk):
         self.log_file = None
         self.start_time = None
         self.mod_vars = {}
+        self.merge_cancel = None  # threading.Event while the resume file is being written
+        self.merge_thread = None
+        self.resume_path = None
 
         self._make_vars()
         self._load_settings()
@@ -184,7 +468,10 @@ class DoradoGUI(tk.Tk):
         self.v_input = tk.StringVar()
         self.v_recursive = tk.BooleanVar(value=True)
         self.v_output = tk.StringVar()
-        self.v_mode = tk.StringVar(value="standard")  # standard | custom
+        self.v_resume = tk.BooleanVar(value=False)  # deliberately not remembered between sessions
+        self.v_resume_dir = tk.StringVar()
+        self.v_resume_info = tk.StringVar(value="")
+        self.v_mode =tk.StringVar(value="standard")  # standard | custom
         self.v_type = tk.StringVar(value="dna")
         self.v_speed = tk.StringVar(value="sup")
         self.v_version = tk.StringVar(value="latest")
@@ -204,7 +491,7 @@ class DoradoGUI(tk.Tk):
         self.v_dorado_info = tk.StringVar(value="")
         self.saved_mods = []
 
-    SAVED_KEYS = ["dorado", "models_dir", "input", "recursive", "output", "mode", "type",
+    SAVED_KEYS = ["dorado", "models_dir", "input", "recursive", "output", "resume_dir", "mode", "type",
                   "speed", "version", "custom_model", "custom_mods", "kit", "no_trim",
                   "min_q", "fastq", "reference", "polya", "device", "extra"]
 
@@ -276,6 +563,14 @@ class DoradoGUI(tk.Tk):
         ttk.Label(f, text="Output folder:").grid(row=2, column=0, sticky="w")
         ttk.Entry(f, textvariable=self.v_output).grid(row=2, column=1, sticky="ew", padx=4)
         ttk.Button(f, text="Browse…", command=lambda: self._browse_dir(self.v_output)).grid(row=2, column=2)
+        ttk.Checkbutton(f, text="Resume from BAM folder:", variable=self.v_resume,
+                        command=self._refresh_resume_widgets).grid(row=3, column=0, sticky="w")
+        self.ent_resume = ttk.Entry(f, textvariable=self.v_resume_dir)
+        self.ent_resume.grid(row=3, column=1, sticky="ew", padx=4)
+        self.btn_resume = ttk.Button(f, text="Browse…", command=self._browse_resume)
+        self.btn_resume.grid(row=3, column=2)
+        ttk.Label(f, textvariable=self.v_resume_info, foreground="gray").grid(
+            row=4, column=1, columnspan=2, sticky="w", padx=4)
 
         # --- Model
         f = ttk.LabelFrame(outer, text="Model", padding=6)
@@ -397,9 +692,28 @@ class DoradoGUI(tk.Tk):
         for var in (self.v_dorado, self.v_models_dir, self.v_input, self.v_recursive, self.v_output,
                     self.v_version, self.v_custom_model, self.v_custom_mods, self.v_kit,
                     self.v_no_trim, self.v_min_q, self.v_fastq, self.v_reference, self.v_polya,
-                    self.v_device, self.v_extra):
+                    self.v_device, self.v_extra, self.v_resume, self.v_resume_dir):
             var.trace_add("write", lambda *a: self._update_command())
         self.v_input.trace_add("write", lambda *a: self._update_pod5_count())
+        self.v_resume_dir.trace_add("write", lambda *a: self._refresh_resume_widgets())
+        self._refresh_resume_widgets()
+
+    def _refresh_resume_widgets(self):
+        on = self.v_resume.get()
+        self.ent_resume.configure(state="normal" if on else "disabled")
+        self.btn_resume.configure(state="normal" if on else "disabled")
+        folder = self.v_resume_dir.get()
+        if not on:
+            self.v_resume_info.set("Tick to continue a crashed run: reads already in its BAM files "
+                                   "are kept and not basecalled again.")
+        elif folder and os.path.isdir(folder):
+            bams = find_bams(folder)
+            self.v_resume_info.set(f"{len(bams)} BAM file(s) found, {fmt_size(total_size(bams))}. "
+                                   "Use the same model and options as the crashed run, "
+                                   "and a new output folder.")
+        else:
+            self.v_resume_info.set("Select the crashed run's output folder (the one containing "
+                                   "bam_pass, so bam_fail is included too).")
 
     def _refresh_model_widgets(self):
         custom = self.v_mode.get() == "custom"
@@ -484,6 +798,12 @@ class DoradoGUI(tk.Tk):
             self.v_input.set(path)
             if not self.v_output.get():
                 self.v_output.set(os.path.join(os.path.dirname(path), "basecalled"))
+
+    def _browse_resume(self):
+        path = filedialog.askdirectory(title="Select the folder with the crashed run's BAM files",
+                                       initialdir=self.v_resume_dir.get() or self.v_output.get() or None)
+        if path:
+            self.v_resume_dir.set(os.path.normpath(path))
 
     def _browse_reference(self):
         path = filedialog.askopenfilename(
@@ -593,6 +913,9 @@ class DoradoGUI(tk.Tk):
             cmd += ["--reference", self.v_reference.get().strip()]
         if self.v_polya.get():
             cmd.append("--estimate-poly-a")
+        if self.v_resume.get():
+            # joined copy of the old BAM files, written just before dorado starts
+            cmd += ["--resume-from", os.path.join(self.v_output.get() or "<output folder>", RESUME_FILE)]
         cmd += ["--output-dir", self.v_output.get() or "<output folder>"]
         if self.v_extra.get().strip():
             cmd += [t.strip('"') for t in shlex.split(self.v_extra.get(), posix=False)]
@@ -645,6 +968,15 @@ class DoradoGUI(tk.Tk):
                 float(self.v_min_q.get())
             except ValueError:
                 errs.append("Min. Q-score must be a number.")
+        if self.v_resume.get():
+            old, out = self.v_resume_dir.get(), self.v_output.get()
+            if not old or not os.path.isdir(old):
+                errs.append("Select the folder with the BAM files of the crashed run.")
+            elif not find_bams(old):
+                errs.append("No .bam files found in the resume folder.")
+            elif out and (is_within(out, old) or is_within(old, out)):
+                errs.append("When resuming, the output folder must be a new folder outside the one "
+                            "holding the old BAM files, so the old files cannot be overwritten.")
         if errs:
             messagebox.showerror(APP_NAME, "\n".join(errs))
             return False
@@ -656,12 +988,68 @@ class DoradoGUI(tk.Tk):
         return True
 
     # ------------------------------------------------------------------- run
+    def _prepare_resume(self, cmd):
+        """Check the old BAM files. Returns (paths, header, notes) or None to abort."""
+        folder = self.v_resume_dir.get()
+        self.v_status.set("Checking previous BAM files…")
+        self.update_idletasks()
+        good, bad = scan_bam_headers(find_bams(folder))
+        self.v_status.set("Idle")
+        if not good:
+            messagebox.showerror(APP_NAME, "None of the BAM files in the resume folder could be read.")
+            return None
+        paths = [p for p, _, _ in good]
+        notes = [f"# Resuming from {len(paths)} BAM file(s) in {folder}"]
+        notes += [f"# Skipped unreadable file {p}: {why}" for p, why in bad]
+
+        cls = [basecaller_cl(text) for _, text, _ in good]
+        old = cls[0]
+        if len(set(cls)) > 1:
+            if not messagebox.askyesno(APP_NAME, "The BAM files in the resume folder were written by "
+                                       f"{len(set(cls))} different dorado commands, so the folder seems "
+                                       "to hold more than one run.\n\nContinue anyway?"):
+                return None
+        if not old:
+            if not messagebox.askyesno(APP_NAME, "The BAM files do not record a 'dorado basecaller' "
+                                       "command, so dorado will probably refuse to resume from them."
+                                       "\n\nTry anyway?"):
+                return None
+        else:
+            notes.append(f"# Previous command: {old}")
+            old_model, new_model = cl_model(old), model_name(cmd[2])
+            if old_model and old_model != new_model:
+                if not messagebox.askyesno(APP_NAME, "The crashed run used a different model selection:\n\n"
+                                           f"    previous run:  {old_model}\n    now selected:  {new_model}\n\n"
+                                           "Dorado only resumes when the model is the same.\n\nContinue anyway?"):
+                    return None
+
+        # the old reads are copied twice: into the resume file and into the new output
+        need = 2 * total_size(paths)
+        probe = os.path.abspath(self.v_output.get())
+        while not os.path.isdir(probe) and os.path.dirname(probe) != probe:
+            probe = os.path.dirname(probe)
+        try:
+            free = shutil.disk_usage(probe).free
+        except OSError:
+            free = None
+        if free is not None and free < need:
+            if not messagebox.askyesno(APP_NAME, f"Resuming needs about {fmt_size(need)} for the reads that "
+                                       f"are already basecalled, but only {fmt_size(free)} is free on the "
+                                       "output drive.\n\nContinue anyway?"):
+                return None
+        return paths, merged_header([(text, refs) for _, text, refs in good]), notes
+
     def _start(self):
-        if self.proc is not None:
+        if self.proc is not None or self.merge_cancel is not None:
             return
         if not self._validate():
             return
         cmd = self._build_command()
+        resume = None
+        if self.v_resume.get():
+            resume = self._prepare_resume(cmd)
+            if resume is None:
+                return
         self._save_settings()
         out = self.v_output.get()
         os.makedirs(out, exist_ok=True)
@@ -675,20 +1063,89 @@ class DoradoGUI(tk.Tk):
         self._log_clear()
         self._log(f"# {time.strftime('%Y-%m-%d %H:%M:%S')}\n# {self._cmd_to_str(cmd)}\n\n")
 
+        self.btn_start.configure(state="disabled")
+        self.btn_stop.configure(state="normal")
+        self.v_progress.set("")
+        if resume:
+            self._start_merge(cmd, *resume)
+        else:
+            self._launch(cmd)
+
+    def _start_merge(self, cmd, paths, header, notes):
+        """Join the old BAM files into the --resume-from file, then launch dorado."""
+        self._log("\n".join(notes) + "\n")
+        self.resume_path = dest = cmd[cmd.index("--resume-from") + 1]
+        self.merge_cancel = cancel = threading.Event()
+        self.start_time = time.time()
+        self.v_status.set("Preparing resume file…")
+        total = total_size(paths) or 1
+
+        def progress(done):
+            self.msg_queue.put(("progress", f"Joining previous BAM files: {100 * done / total:.0f}%  "
+                                            f"({fmt_size(done)} of {fmt_size(total)})"))
+
+        def worker():
+            try:
+                n, truncated = merge_bams(paths, header, dest, progress, cancel)
+                self.msg_queue.put(("merged", (cmd, n, truncated)))
+            except InterruptedError:
+                self.msg_queue.put(("merge_failed", None))
+            except OSError as e:
+                self.msg_queue.put(("merge_failed", str(e)))
+
+        self.merge_thread = threading.Thread(target=worker, daemon=True)
+        self.merge_thread.start()
+
+    def _merged(self, cmd, n, truncated):
+        self.merge_cancel = None
+        self.v_progress.set("")
+        for p in truncated:
+            self._log(f"# Incomplete file (cut off by the crash), complete reads kept: {p}\n")
+        self._log(f"# {n} reads from the previous run will be kept and not basecalled again\n\n")
+        if n == 0:
+            self._abort_start("The old BAM files contain no complete reads, so there is nothing to "
+                              "resume from. Untick 'Resume from BAM folder' to basecall from scratch.")
+            return
+        self._launch(cmd)
+
+    def _merge_failed(self, error):
+        self.merge_cancel = None
+        self.v_progress.set("")
+        if error is None:
+            self._log("# Stopped by user\n")
+            self._abort_start(None)
+        else:
+            self._abort_start(f"Could not write the resume file:\n{error}")
+
+    def _abort_start(self, error):
+        if error:
+            self._log(error + "\n")
+            messagebox.showerror(APP_NAME, error)
+        self._remove_resume_file()
+        self.btn_start.configure(state="normal")
+        self.btn_stop.configure(state="disabled")
+        self.v_status.set("Failed" if error else "Stopped")
+        self._close_log()
+
+    def _remove_resume_file(self):
+        """The resume file is only a temporary copy; the original BAM files are never touched."""
+        if self.resume_path:
+            try:
+                os.remove(self.resume_path)
+            except OSError:
+                pass
+            self.resume_path = None
+
+    def _launch(self, cmd):
         try:
             self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                          stdin=subprocess.DEVNULL, **popen_kwargs())
         except OSError as e:
-            self._log(f"Failed to start dorado: {e}\n")
-            messagebox.showerror(APP_NAME, f"Failed to start dorado:\n{e}")
-            self._close_log()
+            self._abort_start(f"Failed to start dorado:\n{e}")
             return
 
         self.start_time = time.time()
-        self.btn_start.configure(state="disabled")
-        self.btn_stop.configure(state="normal")
         self.v_status.set("Running…")
-        self.v_progress.set("")
         threading.Thread(target=self._reader, args=(self.proc,), daemon=True).start()
         self._tick()
 
@@ -721,7 +1178,11 @@ class DoradoGUI(tk.Tk):
         self.msg_queue.put(("done", rc))
 
     def _stop(self):
-        if self.proc and self.proc.poll() is None:
+        if self.merge_cancel is not None:
+            if messagebox.askyesno(APP_NAME, "Stop preparing the resume file?") and self.merge_cancel:
+                self.merge_cancel.set()
+                self.v_status.set("Stopping…")
+        elif self.proc and self.proc.poll() is None:
             if messagebox.askyesno(APP_NAME, "Stop the running basecalling job?"):
                 self._log("\n# Stopped by user\n")
                 self.proc.terminate()
@@ -743,6 +1204,10 @@ class DoradoGUI(tk.Tk):
                     self.v_progress.set(payload[-160:])
                 elif kind == "done":
                     self._finished(payload)
+                elif kind == "merged":
+                    self._merged(*payload)
+                elif kind == "merge_failed":
+                    self._merge_failed(payload)
                 elif kind == "dorado_info":
                     self.v_dorado_info.set(payload)
                 elif kind == "catalog":
@@ -773,6 +1238,7 @@ class DoradoGUI(tk.Tk):
         else:
             self.v_status.set(f"Failed / stopped (exit code {rc})")
             self._log(f"\n# dorado exited with code {rc} after {dur}\n")
+        self._remove_resume_file()
         self._close_log()
         self.bell()
 
@@ -796,6 +1262,12 @@ class DoradoGUI(tk.Tk):
             self.log_file = None
 
     def _on_close(self):
+        if self.merge_cancel is not None:
+            if not messagebox.askyesno(APP_NAME, "The resume file is still being prepared. Stop and quit?"):
+                return
+            self.merge_cancel.set()
+            self.merge_thread.join(10)
+            self._remove_resume_file()
         if self.proc and self.proc.poll() is None:
             if not messagebox.askyesno(APP_NAME, "Basecalling is still running. Stop it and quit?"):
                 return
