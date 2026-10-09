@@ -157,6 +157,10 @@ def count_pod5(folder, recursive):
 # all tags (MM/ML modification calls, barcodes, poly(A), moves, ...) are kept.
 # ---------------------------------------------------------------------------
 RESUME_FILE = "_resume_input.bam"
+RESUME_INFO = "_resume_input.json"  # what RESUME_FILE was joined from, so a retry can reuse it
+# dorado refuses --resume-from together with --output-dir, so a resumed run writes
+# this one file (.bam or .fastq) through stdout instead
+RESUME_OUTPUT = "calls"
 BGZF_EOF = bytes.fromhex("1f8b08040000000000ff0600424302001b0003000000000000000000")
 
 
@@ -185,6 +189,27 @@ def fmt_size(n):
         if n < 1024 or unit == "GB":
             return f"{n:.0f} {unit}" if unit == "bytes" else f"{n:.1f} {unit}"
         n /= 1024
+
+
+def bam_signature(paths):
+    """Path, size and modification time of each file: changes when the files do."""
+    sig = []
+    for p in paths:
+        st = os.stat(p)
+        sig.append([os.path.abspath(p), st.st_size, st.st_mtime_ns])
+    return sig
+
+
+def load_resume_info(resume_path):
+    """Info saved next to a completely written resume file; None if missing or outdated."""
+    try:
+        with open(os.path.join(os.path.dirname(resume_path), RESUME_INFO), encoding="utf-8") as fh:
+            info = json.load(fh)
+        if info["size"] == os.path.getsize(resume_path):
+            return info
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return None
 
 
 def is_within(path, parent):
@@ -449,6 +474,7 @@ class DoradoGUI(tk.Tk):
         self.merge_cancel = None  # threading.Event while the resume file is being written
         self.merge_thread = None
         self.resume_path = None
+        self.stdout_path = None  # file dorado's stdout goes to (resumed runs only)
 
         self._make_vars()
         self._load_settings()
@@ -916,18 +942,29 @@ class DoradoGUI(tk.Tk):
         if self.v_resume.get():
             # joined copy of the old BAM files, written just before dorado starts
             cmd += ["--resume-from", os.path.join(self.v_output.get() or "<output folder>", RESUME_FILE)]
-        cmd += ["--output-dir", self.v_output.get() or "<output folder>"]
+        else:
+            cmd += ["--output-dir", self.v_output.get() or "<output folder>"]
         if self.v_extra.get().strip():
             cmd += [t.strip('"') for t in shlex.split(self.v_extra.get(), posix=False)]
         return cmd
 
+    def _stdout_file(self):
+        """File a resumed run is written to (dorado's stdout); None for a normal run."""
+        if not self.v_resume.get():
+            return None
+        return os.path.join(self.v_output.get() or "<output folder>",
+                            RESUME_OUTPUT + (".fastq" if self.v_fastq.get() else ".bam"))
+
     @staticmethod
-    def _cmd_to_str(cmd):
-        return subprocess.list2cmdline(cmd) if IS_WINDOWS else shlex.join(cmd)
+    def _cmd_to_str(cmd, stdout_file=None):
+        text = subprocess.list2cmdline(cmd) if IS_WINDOWS else shlex.join(cmd)
+        if stdout_file:
+            text += " > " + (subprocess.list2cmdline([stdout_file]) if IS_WINDOWS else shlex.quote(stdout_file))
+        return text
 
     def _update_command(self):
         try:
-            text = self._cmd_to_str(self._build_command())
+            text = self._cmd_to_str(self._build_command(), self._stdout_file())
         except ValueError as e:  # bad quoting in extra args
             text = f"(invalid extra arguments: {e})"
         self.txt_cmd.configure(state="normal")
@@ -981,7 +1018,12 @@ class DoradoGUI(tk.Tk):
             messagebox.showerror(APP_NAME, "\n".join(errs))
             return False
         out = self.v_output.get()
-        if os.path.isdir(out) and os.listdir(out):
+        target = self._stdout_file()
+        if target and os.path.exists(target):
+            if not messagebox.askyesno(APP_NAME, f"The output file already exists:\n{target}\n\n"
+                                       "It will be overwritten. Continue?"):
+                return False
+        elif os.path.isdir(out) and os.listdir(out):
             if not messagebox.askyesno(APP_NAME, f"The output folder is not empty:\n{out}\n\n"
                                        "Dorado may add to or overwrite files there. Continue?"):
                 return False
@@ -989,7 +1031,8 @@ class DoradoGUI(tk.Tk):
 
     # ------------------------------------------------------------------- run
     def _prepare_resume(self, cmd):
-        """Check the old BAM files. Returns (paths, header, notes) or None to abort."""
+        """Check the old BAM files. Returns (paths, header, notes, info) or None to abort.
+        info is set when the resume file of an earlier attempt can be used again."""
         folder = self.v_resume_dir.get()
         self.v_status.set("Checking previous BAM files…")
         self.update_idletasks()
@@ -1023,8 +1066,15 @@ class DoradoGUI(tk.Tk):
                                            "Dorado only resumes when the model is the same.\n\nContinue anyway?"):
                     return None
 
+        try:
+            info = load_resume_info(cmd[cmd.index("--resume-from") + 1])
+            if info and info.get("sources") != bam_signature(paths):
+                info = None
+        except OSError:
+            info = None
+
         # the old reads are copied twice: into the resume file and into the new output
-        need = 2 * total_size(paths)
+        need = (1 if info else 2) * total_size(paths)
         probe = os.path.abspath(self.v_output.get())
         while not os.path.isdir(probe) and os.path.dirname(probe) != probe:
             probe = os.path.dirname(probe)
@@ -1037,7 +1087,7 @@ class DoradoGUI(tk.Tk):
                                        f"are already basecalled, but only {fmt_size(free)} is free on the "
                                        "output drive.\n\nContinue anyway?"):
                 return None
-        return paths, merged_header([(text, refs) for _, text, refs in good]), notes
+        return paths, merged_header([(text, refs) for _, text, refs in good]), notes, info
 
     def _start(self):
         if self.proc is not None or self.merge_cancel is not None:
@@ -1061,7 +1111,8 @@ class DoradoGUI(tk.Tk):
             self.log_file = None
 
         self._log_clear()
-        self._log(f"# {time.strftime('%Y-%m-%d %H:%M:%S')}\n# {self._cmd_to_str(cmd)}\n\n")
+        self.stdout_path = self._stdout_file()
+        self._log(f"# {time.strftime('%Y-%m-%d %H:%M:%S')}\n# {self._cmd_to_str(cmd, self.stdout_path)}\n\n")
 
         self.btn_start.configure(state="disabled")
         self.btn_stop.configure(state="normal")
@@ -1071,10 +1122,20 @@ class DoradoGUI(tk.Tk):
         else:
             self._launch(cmd)
 
-    def _start_merge(self, cmd, paths, header, notes):
+    def _start_merge(self, cmd, paths, header, notes, info):
         """Join the old BAM files into the --resume-from file, then launch dorado."""
         self._log("\n".join(notes) + "\n")
         self.resume_path = dest = cmd[cmd.index("--resume-from") + 1]
+        if info:
+            self._log("# Using the resume file left by the previous attempt (old BAM files unchanged)\n")
+            self.start_time = time.time()
+            self._merged(cmd, info.get("records", -1), info.get("truncated", []))
+            return
+        self._remove_resume_file(forget=False)  # outdated leftovers
+        try:
+            sources = bam_signature(paths)
+        except OSError:
+            sources = None
         self.merge_cancel = cancel = threading.Event()
         self.start_time = time.time()
         self.v_status.set("Preparing resume file…")
@@ -1086,7 +1147,15 @@ class DoradoGUI(tk.Tk):
 
         def worker():
             try:
-                n, truncated = merge_bams(paths, header, dest, progress, cancel)
+                n, truncated = merge_bams(paths, header, dest + ".part", progress, cancel)
+                os.replace(dest + ".part", dest)
+                if sources is not None and n:
+                    try:  # lets a later attempt reuse the file instead of joining again
+                        with open(os.path.join(os.path.dirname(dest), RESUME_INFO), "w", encoding="utf-8") as fh:
+                            json.dump({"sources": sources, "records": n, "truncated": truncated,
+                                       "size": os.path.getsize(dest)}, fh)
+                    except OSError:
+                        pass
                 self.msg_queue.put(("merged", (cmd, n, truncated)))
             except InterruptedError:
                 self.msg_queue.put(("merge_failed", None))
@@ -1101,11 +1170,16 @@ class DoradoGUI(tk.Tk):
         self.v_progress.set("")
         for p in truncated:
             self._log(f"# Incomplete file (cut off by the crash), complete reads kept: {p}\n")
-        self._log(f"# {n} reads from the previous run will be kept and not basecalled again\n\n")
+        self._log(f"# {n} reads from the previous run will be kept and not basecalled again\n")
         if n == 0:
             self._abort_start("The old BAM files contain no complete reads, so there is nothing to "
                               "resume from. Untick 'Resume from BAM folder' to basecall from scratch.")
             return
+        self._log(f"# All reads are written to one file: {self.stdout_path}\n")
+        if "--kit-name" in cmd:
+            self._log("# Barcodes are stored in that file (BC tag); split it afterwards with "
+                      "'dorado demux --no-classify'\n")
+        self._log("\n")
         self._launch(cmd)
 
     def _merge_failed(self, error):
@@ -1117,43 +1191,61 @@ class DoradoGUI(tk.Tk):
         else:
             self._abort_start(f"Could not write the resume file:\n{error}")
 
-    def _abort_start(self, error):
+    def _abort_start(self, error, keep_resume_file=False):
         if error:
             self._log(error + "\n")
             messagebox.showerror(APP_NAME, error)
-        self._remove_resume_file()
+        if keep_resume_file:
+            self.resume_path = None
+        else:
+            self._remove_resume_file()
         self.btn_start.configure(state="normal")
         self.btn_stop.configure(state="disabled")
         self.v_status.set("Failed" if error else "Stopped")
         self._close_log()
 
-    def _remove_resume_file(self):
+    def _remove_resume_file(self, forget=True):
         """The resume file is only a temporary copy; the original BAM files are never touched."""
         if self.resume_path:
-            try:
-                os.remove(self.resume_path)
-            except OSError:
-                pass
-            self.resume_path = None
+            for path in (self.resume_path, self.resume_path + ".part",
+                         os.path.join(os.path.dirname(self.resume_path), RESUME_INFO)):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            if forget:
+                self.resume_path = None
 
     def _launch(self, cmd):
+        out_fh = None
         try:
-            self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                         stdin=subprocess.DEVNULL, **popen_kwargs())
+            if self.stdout_path:
+                # the reads go straight into the file, only messages and progress come to the GUI
+                out_fh = open(self.stdout_path, "wb")
+                self.proc = subprocess.Popen(cmd, stdout=out_fh, stderr=subprocess.PIPE,
+                                             stdin=subprocess.DEVNULL, **popen_kwargs())
+                stream = self.proc.stderr
+            else:
+                self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                             stdin=subprocess.DEVNULL, **popen_kwargs())
+                stream = self.proc.stdout
         except OSError as e:
-            self._abort_start(f"Failed to start dorado:\n{e}")
+            self._abort_start(f"Failed to start dorado:\n{e}", keep_resume_file=True)
             return
+        finally:
+            if out_fh:
+                out_fh.close()
 
         self.start_time = time.time()
         self.v_status.set("Running…")
-        threading.Thread(target=self._reader, args=(self.proc,), daemon=True).start()
+        threading.Thread(target=self._reader, args=(self.proc, stream), daemon=True).start()
         self._tick()
 
-    def _reader(self, proc):
-        """Read dorado's output; '\\r'-terminated chunks are progress-bar updates."""
+    def _reader(self, proc, stream):
+        """Read dorado's messages; '\\r'-terminated chunks are progress-bar updates."""
         buf = b""
         while True:
-            chunk = proc.stdout.read1(4096) if hasattr(proc.stdout, "read1") else proc.stdout.read(1)
+            chunk = stream.read1(4096) if hasattr(stream, "read1") else stream.read(1)
             if not chunk:
                 break
             buf += chunk
@@ -1238,7 +1330,12 @@ class DoradoGUI(tk.Tk):
         else:
             self.v_status.set(f"Failed / stopped (exit code {rc})")
             self._log(f"\n# dorado exited with code {rc} after {dur}\n")
-        self._remove_resume_file()
+        if rc == 0:
+            self._remove_resume_file()
+        elif self.resume_path:
+            # joining the old BAM files takes long; Start with the same folders uses the file again
+            self._log(f"# Resume file kept for another attempt: {self.resume_path}\n")
+            self.resume_path = None
         self._close_log()
         self.bell()
 
