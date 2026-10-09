@@ -28,11 +28,13 @@ If basecalling crashed or the PC restarted, the reads that were already written 
 3. Choose a **new, empty output folder**. The GUI refuses an output folder inside or around the old one, so the old files can never be overwritten.
 4. **Start**. The GUI first joins the old BAM files into one temporary file (`_resume_input.bam` in the new output folder), because `dorado --resume-from` accepts only a single file. Then it starts dorado, which copies those reads into the new output and basecalls only the remaining ones.
 
+- A resumed run writes all reads to a single file, `calls.bam` (or `calls.fastq`) in the new output folder, instead of `bam_pass`/`bam_fail` subfolders: dorado does not accept `--resume-from` together with `--output-dir`. With a barcode kit the barcode of each read is stored in that file; split it per barcode afterwards with `dorado demux --no-classify --output-dir <folder> calls.bam`.
 - Reads are copied unchanged, so modified-base calls (MM/ML tags), barcodes and all other tags are kept.
 - BAM files that were cut off by the crash are fine: their complete reads are used and the broken end is dropped. This is listed in the log.
 - The old BAM files are only read. Once the resumed run has finished and you have checked it, the old output folder can be deleted; the new one is complete.
-- You need free disk space of about twice the size of the old BAM files. The temporary file is removed when dorado exits.
-- If the resumed run crashes too, resume again from its output folder (with another new output folder), unless it crashed in the first minutes while still copying the old reads; then resume from the original folder again.
+- You need free disk space of about twice the size of the old BAM files. The temporary file is removed when dorado finishes successfully.
+- If dorado fails or is stopped, the temporary file is kept. Pressing **Start** again with the same resume and output folders then skips the joining step and starts dorado directly (`calls.bam` is written anew). The file is joined again only if the old BAM files have changed.
+- If the resumed run crashes after basecalling for a while, resume from its output folder instead (with another new output folder) to keep the newly basecalled reads too. `_resume_input.bam` in the crashed folder is ignored and can be deleted.
 - No extra software is needed; joining uses only Python.
 
 Settings are remembered in `%APPDATA%\dorado_gui\settings.json`.
